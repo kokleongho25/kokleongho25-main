@@ -97,6 +97,7 @@ import {
   isDfuSeFile,
 } from "../domain/firmware/dfuse.js";
 import { hasFitImagesNode } from "../domain/firmware/fitImage.js";
+import { hasCompoundFileSignature } from "../domain/windows/compoundFile.js";
 import { hasMftFileRecordHeader } from "../domain/windows/ntfsMft.js";
 import {
   locateEspFlashLayout,
@@ -834,6 +835,7 @@ const detectArtifactFormat = async (
     });
   if (esp === "esp-image") return "esp-image";
   if (hasFitImagesNode(magic)) return "fit";
+  if (hasCompoundFileSignature(magic)) return "compound-file";
   if (hasMftFileRecordHeader(magic)) return "ntfs-mft";
   // Binary plists, including keyed archives, often use other extensions.
   if (hasBinaryPlistSignature(magic)) return "plist";
@@ -918,6 +920,7 @@ const isArchiveFormat = (
     "dfuse",
     "esp-flash-image",
     "fit",
+    "compound-file",
     "ntfs-mft",
   ].includes(format);
 
