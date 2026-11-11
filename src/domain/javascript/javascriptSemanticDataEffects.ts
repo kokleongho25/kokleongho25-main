@@ -11,6 +11,7 @@ import {
   javaScriptExpressionWrapperTarget,
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
+  staticObjectProperty,
   semanticStaticPropertyName,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
@@ -271,6 +272,9 @@ const collectRequests = (
       !URL.canParse(endpoint)
     )
       return;
+    // `http`/`https` validate `options.method` with `checkIsHttpToken` before the request
+    // exists, so a literal outside the token set throws from the call itself.
+    if (rejectsHttpMethodLiteral(node, method)) return;
     output.push({
       node,
       operation: {
@@ -579,6 +583,148 @@ const requestFields = (
   });
 };
 
+/**
+ * The characters RFC 9110 allows in a method token, which is what Node's
+ * `checkIsHttpToken` accepts.
+ *
+ * Measured on Node 24.22.1, `method: "M-SEARCH"`, `"X"` and the punctuation set
+ * `"!#$%&'*+-.^_` | "~"` all construct a request, while `"G/ET"`, `"G:ET"`, `"G(ET"`,
+ * `"G,ET"`, `"G"ET"`, `"GéT"`, `" "` and `"\\t"` throw `ERR_INVALID_HTTP_TOKEN`. The set is
+ * a closed character class rather than a list of verbs, so `"GET "` fails on the trailing
+ * space and `"get"` is accepted.
+ */
+const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]*$/u;
+
+/**
+ * Whether a literal `options.method` makes `http.request` throw before any request exists.
+ *
+ * `http` and `https` validate the method with `checkIsHttpToken` before they build the
+ * request, so a literal outside `HTTP_TOKEN` throws `ERR_INVALID_HTTP_TOKEN` from the call
+ * itself. Measured on Node 24.22.1, an empty string is accepted: Node treats `""` as "not
+ * given" and falls back to `GET`. A non-string value throws `ERR_INVALID_ARG_TYPE` too, but
+ * it is left undecided here because the reported fields do not describe the type check.
+ */
+/**
+ * Whether a getter is copied before the last write of `member`.
+ *
+ * `Object.assign` walks the source in **enumeration** order, which is neither source order nor
+ * AST order. Two rules decide it, each measured on Node 24.22.1:
+ *
+ * - An ECMAScript array index (a canonical integer below `2 ** 32 - 1`) enumerates first,
+ *   ascending. `4294967295` is *not* an array index, so it enumerates with the string keys.
+ * - A redefined key keeps its **first** insertion position: `{x: 0, method: "BAD METHOD",
+ *   get x() {...}}` enumerates the final `x` getter before `method`, so it returns a GET,
+ *   while the same getter on a fresh key `y` comes after and the call throws
+ *   `ERR_INVALID_HTTP_TOKEN`.
+ */
+const METHOD_GETTER_ARRAY_INDEX_LIMIT = 2 ** 32 - 1;
+
+const methodGetterPrecedesMember = (
+  options: t.ObjectExpression,
+  member: string,
+): boolean => {
+  // A key's position comes from its first insertion; its descriptor comes from the last.
+  const firstIndex = new Map<string, number>();
+  const lastDescriptor = new Map<
+    string,
+    { readonly node: t.ObjectProperty | t.ObjectMethod; readonly index: number }
+  >();
+  for (const [index, property] of options.properties.entries()) {
+    if (t.isSpreadElement(property)) continue;
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) continue;
+    if (!firstIndex.has(name)) firstIndex.set(name, index);
+    lastDescriptor.set(name, { node: property, index });
+  }
+  const orderOf = (name: string): readonly [number, number] => {
+    const position = firstIndex.get(name) ?? Number.MAX_SAFE_INTEGER;
+    const key = Number(name);
+    return Number.isInteger(key) &&
+      String(key) === name &&
+      key >= 0 &&
+      key < METHOD_GETTER_ARRAY_INDEX_LIMIT
+      ? [0, key]
+      : [1, position];
+  };
+  const before = (
+    left: readonly [number, number],
+    right: readonly [number, number],
+  ): boolean =>
+    left[0] !== right[0] ? left[0] < right[0] : left[1] < right[1];
+  let memberOrder: readonly [number, number] | undefined;
+  let getterOrder: readonly [number, number] | undefined;
+  for (const [name, { node }] of lastDescriptor) {
+    const order = orderOf(name);
+    if (
+      t.isObjectMethod(node) &&
+      node.kind === "get" &&
+      (getterOrder === undefined || before(order, getterOrder))
+    )
+      getterOrder = order;
+    if (name === member) memberOrder = order;
+  }
+  return (
+    getterOrder !== undefined &&
+    (memberOrder === undefined || before(getterOrder, memberOrder))
+  );
+};
+
+const rejectsHttpMethodLiteral = (
+  node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
+  method: JavaScriptSemanticRequestOperation["method"],
+): boolean => {
+  // `fetch` and `WebSocket` read a different member and do not validate a token.
+  if (method !== "get" && method !== "request") return false;
+  // A spread before the options slot can supply several runtime arguments, so a later
+  // syntactic object is not necessarily the options Node reads. Measured on Node
+  // 24.22.1, `http.request(...[{host, path}, () => {}], {method: "BAD METHOD"})` returns
+  // a GET request, so the trailing object is ignored and the call must be kept. A spread
+  // *after* the options cannot move it: `http.request({method: "BAD METHOD"}, ...[])`
+  // still throws ERR_INVALID_HTTP_TOKEN.
+  const firstArgument = node.arguments[0];
+  if (firstArgument !== undefined && t.isSpreadElement(firstArgument))
+    return false;
+  // A callable in slot 0 is the callback, so Node replaces the options with defaults and
+  // never reads a later object. Measured on Node 24.22.1,
+  // `http.request(() => {}, {method: "BAD METHOD"})` returns a GET ClientRequest, while
+  // `http.request({method: "BAD METHOD"}, () => {})` throws ERR_INVALID_HTTP_TOKEN
+  // because the method in slot 0 is validated before the callback is registered.
+  const head = node.arguments[0];
+  // The value is unwrapped first, because an erased TypeScript assertion leaves the same
+  // function at runtime. Measured on Node 24.22.1,
+  // `http.request((() => {}) as any, {method: "BAD METHOD"})` returns a default GET.
+  const headValue =
+    head === undefined ? undefined : unwrapJavaScriptExpression(head).node;
+  if (
+    headValue !== undefined &&
+    (t.isArrowFunctionExpression(headValue) ||
+      t.isFunctionExpression(headValue))
+  )
+    return false;
+  // The value is unwrapped before the slot is chosen, because an erased TypeScript
+  // assertion is the same object at runtime: measured on Node 24.22.1,
+  // `http.request({method: "BAD METHOD"} as any)` throws ERR_INVALID_HTTP_TOKEN.
+  const first = node.arguments[0];
+  const firstValue =
+    first === undefined ? undefined : unwrapJavaScriptExpression(first).node;
+  const options =
+    firstValue !== undefined && t.isObjectExpression(firstValue)
+      ? firstValue
+      : unwrapJavaScriptExpression(node.arguments[1] ?? first!).node;
+  if (!t.isObjectExpression(options)) return false;
+  // `ClientRequest` copies the options with `Object.assign` in property order, so a getter
+  // can only rewrite a member that comes after it. Measured on Node 24.22.1,
+  // `http.request({get x() { this.method = "GET"; }, method: "BAD METHOD"})` returns a GET
+  // request while `{method: "BAD METHOD", get x() {...}}` throws ERR_INVALID_HTTP_TOKEN,
+  // because the invalid value was copied first.
+  if (methodGetterPrecedesMember(options, "method")) return false;
+  const expression = options;
+  const lookup = staticObjectProperty(expression, "method");
+  if (lookup.status !== "explicit") return false;
+  const literal = readExactJavaScriptLiteral(lookup.value);
+  if (!literal.found || typeof literal.value !== "string") return false;
+  return literal.value !== "" && !HTTP_TOKEN.test(literal.value);
+};
 const requestEndpoint = (
   node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
 ): string | null =>
