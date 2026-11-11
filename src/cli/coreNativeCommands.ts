@@ -2,6 +2,7 @@ import { nativeInstructionInputSchema } from "../domain/native/nativeInstruction
 import { nativeFunctionAnnotationsInputSchema } from "../domain/native/nativeFunctionAnnotations.js";
 import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { nativeDispatchMetadataInputSchema } from "../domain/native/objcSwiftMetadata.js";
+import { nativeFunctionAnnotationsInputSchema } from "../domain/native/nativeFunctionAnnotations.js";
 import { nativeInvestigationTraceLimitsSchema } from "../domain/native/nativeInvestigationGraph.js";
 import { nativeValueTraceInputSchema } from "../domain/native/nativeValueTrace.js";
 import { nativeDataTypeInputSchema } from "../domain/native/nativeDataType.js";
